@@ -1,27 +1,32 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
-import torch
 from PIL import Image
 from io import BytesIO
-from src.models.cnn_model import get_model
-from src.data.augmentation import get_val_augmentation
+import numpy as np
+import onnxruntime as ort
 from database.models import save_prediction
 import os
 
-router  = APIRouter()
-DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
-_model  = None
+router = APIRouter()
+_session = None
 
-def get_cnn():
-    global _model
-    if _model is None:
-        _model = get_model(DEVICE)
-        model_path = "models/saved/cnn_best.pt"
-        if os.path.exists(model_path):
-            _model.load_state_dict(
-                torch.load(model_path, map_location=DEVICE)
-            )
-        _model.eval()
-    return _model
+def get_session():
+    global _session
+    if _session is None:
+        path = "models/saved/cnn_best.onnx"
+        if not os.path.exists(path):
+            raise HTTPException(503, "Modèle non disponible.")
+        _session = ort.InferenceSession(path)
+    return _session
+
+def preprocess_image(image_bytes: bytes) -> np.ndarray:
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    img = img.resize((224, 224))
+    arr = np.array(img).astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406])
+    std  = np.array([0.229, 0.224, 0.225])
+    arr  = (arr - mean) / std
+    arr  = arr.transpose(2, 0, 1)
+    return arr[np.newaxis, :].astype(np.float32)
 
 def get_recommendation(label: str, confidence: float) -> str:
     if label == "Parasitized" and confidence > 0.85:
@@ -35,17 +40,14 @@ async def predict_image(file: UploadFile = File(...)):
     if file.content_type not in ["image/jpeg", "image/png"]:
         raise HTTPException(400, "Format non supporté. JPEG ou PNG.")
 
-    contents  = await file.read()
-    img       = Image.open(BytesIO(contents)).convert("RGB")
-    transform = get_val_augmentation()
-    tensor    = transform(img).unsqueeze(0).to(DEVICE)
+    contents = await file.read()
+    tensor   = preprocess_image(contents)
+    session  = get_session()
 
-    model = get_cnn()
-    with torch.no_grad():
-        probs = torch.softmax(model(tensor), dim=1)[0]
-
+    outputs    = session.run(None, {"input": tensor})
+    probs      = outputs[0][0]
     label      = "Parasitized" if probs[0] > probs[1] else "Uninfected"
-    confidence = float(probs.max())
+    confidence = float(max(probs))
 
     pred_id = save_prediction(
         type="image",
